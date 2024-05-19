@@ -8,4 +8,5 @@ num-bigint = "0.4.5"
 num-traits = "0.2.19"
 nvml-wrapper = "0.10.0"
 ocl = "0.19.7"
+openssl = "0.10.64"
 

@@ -1,9 +1,11 @@
 extern crate ocl;
 extern crate nvml_wrapper as nvml;
+extern crate openssl;
 
 use ocl::{ProQue, Buffer, MemFlags, Platform, Device, Context};
 use nvml::Nvml;
 use nvml::enum_wrappers::device::TemperatureSensor;
+use openssl::bn::BigNum;
 use std::{thread, time::Duration, sync::{Arc, Mutex}};
 
 const KERNEL_SRC: &str = r#"
@@ -17,18 +19,19 @@ const KERNEL_SRC: &str = r#"
         return 1;
     }
 
-    __kernel void search_for_large_prime(__global ulong* result, __global ulong* status, ulong start, ulong end) {
+    __kernel void test_prime_candidates(__global ulong* candidates, __global int* results, ulong num_candidates) {
         ulong tid = get_global_id(0);
-        ulong step = get_global_size(0);  // Number of threads
-        for (ulong i = start + tid; i <= end; i += step) {
-            status[tid] = i; // Write the current number being tested to the status buffer
-            if (is_prime(i)) {
-                result[0] = i;
-                return;
-            }
+        if (tid < num_candidates) {
+            results[tid] = is_prime(candidates[tid]);
         }
     }
 "#;
+
+fn generate_large_prime(bits: u32) -> BigNum {
+    let mut prime = BigNum::new().unwrap();
+    prime.generate_prime(bits as i32, false, None, None).unwrap();
+    prime
+}
 
 fn main() {
     // Initialize NVML for GPU monitoring
@@ -45,16 +48,12 @@ fn main() {
         }
     }
 
-    // Define the range to search for primes
-    let start = 10_000_000_000_000u64;
-    let end = start + 1_000_000_000u64; // Adjust this as needed for a larger workload
-
     // Create ProQue for each device
     let mut pro_ques: Vec<Arc<ProQue>> = vec![];
     for platform in &platforms {
         let devices = Device::list_all(&*platform).unwrap();
         for device in devices {
-            let max_threads = 1024; // Limiting to 1024 threads to reduce resource usage
+            let max_threads = 64; // Further reduce the number of threads to avoid resource exhaustion
 
             // Create a context for the specific platform and device
             let context = Context::builder()
@@ -66,7 +65,7 @@ fn main() {
             let pro_que = ProQue::builder()
                 .context(context)
                 .src(KERNEL_SRC)
-                .dims(max_threads) // Use the limited number of threads
+                .dims(max_threads) // Use the further reduced number of threads
                 .device(device)
                 .build()
                 .expect("Failed to create ProQue");
@@ -74,33 +73,36 @@ fn main() {
         }
     }
 
-    let result_buffers: Vec<_> = pro_ques.iter().map(|pq| {
+    let num_candidates = 100; // Number of prime candidates to generate and test
+    let prime_candidates: Vec<u64> = (0..num_candidates)
+        .map(|_| generate_large_prime(64).to_dec_str().unwrap().parse::<u64>().unwrap())
+        .collect(); // Generate 64-bit prime candidates
+    let prime_candidates = Arc::new(prime_candidates);
+
+    let candidates_buffers: Vec<_> = pro_ques.iter().map(|pq| {
         Arc::new(Buffer::<u64>::builder()
             .queue(pq.queue().clone())
-            .flags(MemFlags::new().write_only())
-            .len(1)
+            .flags(MemFlags::new().read_only())
+            .len(num_candidates as usize) // Use usize instead of u64
+            .copy_host_slice(&prime_candidates)
             .build()
-            .expect("Failed to create result buffer"))
+            .expect("Failed to create candidates buffer"))
     }).collect();
 
-    let status_buffers: Vec<_> = pro_ques.iter().map(|pq| {
-        Arc::new(Buffer::<u64>::builder()
+    let results_buffers: Vec<_> = pro_ques.iter().map(|pq| {
+        Arc::new(Buffer::<i32>::builder()
             .queue(pq.queue().clone())
             .flags(MemFlags::new().write_only())
-            .len(pq.dims().to_len())
+            .len(num_candidates as usize) // Use usize instead of u64
             .build()
-            .expect("Failed to create status buffer"))
+            .expect("Failed to create results buffer"))
     }).collect();
 
-    let result_buffers = Arc::new(result_buffers);
-    let status_buffers = Arc::new(status_buffers);
-
-    let kernels: Vec<_> = pro_ques.iter().zip(result_buffers.iter()).zip(status_buffers.iter()).map(|((pq, rb), sb)| {
-        pq.kernel_builder("search_for_large_prime")
+    let kernels: Vec<_> = pro_ques.iter().zip(candidates_buffers.iter()).zip(results_buffers.iter()).map(|((pq, cb), rb)| {
+        pq.kernel_builder("test_prime_candidates")
+            .arg(&**cb) // Dereference Arc
             .arg(&**rb) // Dereference Arc
-            .arg(&**sb) // Dereference Arc
-            .arg(start)
-            .arg(end)
+            .arg(num_candidates as u64)
             .build()
             .expect("Failed to create kernel")
     }).collect();
@@ -118,50 +120,42 @@ fn main() {
 
     // Periodically read the status buffer to monitor thread status and GPU utilization
     let mut threads = vec![];
-    for (i, ((pq, status_buffer), result_buffer)) in pro_ques.iter().zip(status_buffers.iter()).zip(result_buffers.iter()).enumerate() {
+    for (i, (_pq, result_buffer)) in pro_ques.iter().zip(results_buffers.iter()).enumerate() {
         let prime_found = Arc::clone(&prime_found);
         let nvml = Arc::clone(&nvml);
-        let status_buffer = Arc::clone(status_buffer);
-        let result_buffer = Arc::clone(result_buffer);
-        let pq = Arc::clone(pq); // Clone Arc<ProQue> for this thread
+        let result_buffer: Arc<Buffer<i32>> = Arc::clone(result_buffer); // Explicitly specify the type
+        let prime_candidates = Arc::clone(&prime_candidates); // Clone the Arc for each thread
 
         threads.push(thread::spawn(move || {
             let sleep_duration = Duration::from_secs(1);
             let mut elapsed_time = 0;
-            let mut status = vec![0u64; pq.dims().to_len()]; // Number of threads
+            let mut results = vec![0i32; num_candidates as usize]; // Number of threads
 
             loop {
                 if *prime_found.lock().unwrap() {
                     break;
                 }
 
-                // Read the status buffer
-                match status_buffer.read(&mut status).enq() {
+                // Read the results buffer
+                match result_buffer.read(&mut results).enq() {
                     Ok(_) => {
-                        // Print the status of a few threads
-                        println!("Thread statuses for GPU {}:", i);
-                        for j in 0..10.min(status.len()) {
-                            println!("  Thread {}: {}", j, status[j]);
+                        // Print the results of a few threads
+                        println!("Prime test results for GPU {}:", i);
+                        for j in 0..10.min(results.len()) {
+                            println!("  Candidate {}: {}", j, results[j]);
                         }
 
                         // Check if a prime was found
-                        let mut result = vec![0u64; 1];
-                        match result_buffer.read(&mut result).enq() {
-                            Ok(_) => {
-                                if result[0] != 0 {
-                                    println!("Prime found by GPU {}: {}", i, result[0]);
-                                    *prime_found.lock().unwrap() = true;
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                println!("Failed to read result buffer: {:?}", e);
+                        for (j, &res) in results.iter().enumerate() {
+                            if res == 1 {
+                                println!("Prime found by GPU {}: {}", i, prime_candidates[j]);
+                                *prime_found.lock().unwrap() = true;
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        println!("Failed to read status buffer: {:?}", e);
+                        println!("Failed to read result buffer: {:?}", e);
                         break;
                     }
                 }
@@ -191,4 +185,3 @@ fn main() {
 
     println!("Computation finished.");
 }
-
